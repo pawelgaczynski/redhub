@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -12,6 +13,8 @@ import (
 
 	"github.com/IceFireDB/redhub"
 	"github.com/IceFireDB/redhub/pkg/resp"
+	"github.com/pawelgaczynski/gain"
+	"github.com/rs/zerolog"
 )
 
 func main() {
@@ -38,15 +41,16 @@ func main() {
 
 	protoAddr := fmt.Sprintf("%s://%s", network, addr)
 	option := redhub.Options{
-		Multicore: multicore,
-		ReusePort: reusePort,
+		Workers:      runtime.NumCPU(),
+		LoggerLevel:  zerolog.FatalLevel,
+		Architecture: gain.SocketSharding,
 	}
 
 	rh := redhub.NewRedHub(
-		func(c *redhub.Conn) (out []byte, action redhub.Action) {
+		func(c redhub.Conn) {
 			return
 		},
-		func(c *redhub.Conn, err error) (action redhub.Action) {
+		func(c redhub.Conn, err error) {
 			return
 		},
 		func(cmd resp.Command, out []byte) ([]byte, redhub.Action) {

@@ -2,11 +2,14 @@ package redhub
 
 import (
 	"bytes"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/IceFireDB/redhub/pkg/resp"
-	"github.com/panjf2000/gnet"
+	"github.com/pawelgaczynski/gain"
+	gsync "github.com/pawelgaczynski/gain/pkg/pool/sync"
+	"github.com/rs/zerolog"
 )
 
 type Action int
@@ -22,83 +25,91 @@ const (
 	Shutdown
 )
 
-type Conn struct {
-	gnet.Conn
-}
+type Conn gain.Conn
 
 type Options struct {
-	// Multicore indicates whether the server will be effectively created with multi-cores, if so,
-	// then you must take care with synchronizing memory between all event callbacks, otherwise,
-	// it will run the server with single thread. The number of threads in the server will be automatically
-	// assigned to the value of logical CPUs usable by the current process.
-	Multicore bool
-
-	// LockOSThread is used to determine whether each I/O event-loop is associated to an OS thread, it is useful when you
-	// need some kind of mechanisms like thread local storage, or invoke certain C libraries (such as graphics lib: GLib)
-	// that require thread-level manipulation via cgo, or want all I/O event-loops to actually run in parallel for a
-	// potential higher performance.
-	LockOSThread bool
-
-	// ReadBufferCap is the maximum number of bytes that can be read from the client when the readable event comes.
-	// The default value is 64KB, it can be reduced to avoid starving subsequent client connections.
+	// Architecture indicates one of the two available architectures: Reactor and SocketSharding.
 	//
-	// Note that ReadBufferCap will be always converted to the least power of two integer value greater than
-	// or equal to its real amount.
-	ReadBufferCap int
-
-	// LB represents the load-balancing algorithm used when assigning new connections.
-	LB gnet.LoadBalancing
-
-	// NumEventLoop is set up to start the given number of event-loop goroutine.
-	// Note: Setting up NumEventLoop will override Multicore.
-	NumEventLoop int
-
-	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
-	ReusePort bool
-
-	// Ticker indicates whether the ticker has been set up.
-	Ticker bool
-
-	// TCPKeepAlive sets up a duration for (SO_KEEPALIVE) socket option.
+	// The Reactor design pattern has one input called Acceptor,
+	// which demultiplexes the handling of incoming connections to Consumer workers.
+	// The load balancing algorithm can be selected via configuration option.
+	//
+	// The Socket Sharding allows multiple workers to listen on the same address and port combination.
+	// In this case the kernel distributes incoming requests across all the sockets.
+	Architecture gain.ServerArchitecture
+	// AsyncHandler indicates whether the engine should run the OnRead EventHandler method in a separate goroutines.
+	AsyncHandler bool
+	// GoroutinePool indicates use of pool of bounded goroutines for OnRead calls.
+	// Important: Valid only if AsyncHandler is true
+	GoroutinePool bool
+	// CPUAffinity determines whether each engine worker is locked to the one CPU.
+	CPUAffinity bool
+	// ProcessPriority sets the prority of the process to high (-19). Requires root privileges.
+	ProcessPriority bool
+	// Workers indicates the number of consumers or shard workers. The default is runtime.NumCPU().
+	Workers int
+	// CBPFilter uses custom BPF filter to improve the performance of the Socket Sharding architecture.
+	CBPFilter bool
+	// LoadBalancing indicates the load-balancing algorithm to use when assigning a new connection.
+	// Important: valid only for Reactor architecture.
+	LoadBalancing gain.LoadBalancing
+	// SocketRecvBufferSize sets the maximum socket receive buffer in bytes.
+	SocketRecvBufferSize int
+	// SocketSendBufferSize sets the maximum socket send buffer in bytes.
+	SocketSendBufferSize int
+	// TCPKeepAlive sets the TCP keep-alive for the socket.
 	TCPKeepAlive time.Duration
-
-	// TCPNoDelay controls whether the operating system should delay
-	// packet transmission in hopes of sending fewer packets (Nagle's algorithm).
-	//
-	// The default is true (no delay), meaning that data is sent
-	// as soon as possible after a Write.
-	TCPNoDelay gnet.TCPSocketOpt
-
-	// SocketRecvBuffer sets the maximum socket receive buffer in bytes.
-	SocketRecvBuffer int
-
-	// SocketSendBuffer sets the maximum socket send buffer in bytes.
-	SocketSendBuffer int
-
-	// ICodec encodes and decodes TCP stream.
-	Codec gnet.ICodec
+	// LoggerLevel indicates the logging level.
+	LoggerLevel zerolog.Level
+	// PrettyLogger sets the pretty-printing zerolog mode.
+	// Important: it is inefficient so should be used only for debugging.
+	PrettyLogger bool
 }
 
 func NewRedHub(
-	onOpened func(c *Conn) (out []byte, action Action),
-	onClosed func(c *Conn, err error) (action Action),
+	onAccept func(c Conn),
+	onClose func(c Conn, err error),
 	handler func(cmd resp.Command, out []byte) ([]byte, Action),
 ) *redHub {
 	return &redHub{
-		redHubBufMap: make(map[gnet.Conn]*connBuffer),
+		redHubBufMap: make(map[gain.Conn]*connBuffer),
 		connSync:     sync.RWMutex{},
-		onOpened:     onOpened,
-		onClosed:     onClosed,
+		onAccept:     onAccept,
+		onClose:      onClose,
 		handler:      handler,
+		logger:       zerolog.New(os.Stdout).With().Logger().Level(zerolog.ErrorLevel),
 	}
 }
 
+const bytesliceCap = 2048
+
+type byteSlicePool struct {
+	internalPool gsync.Pool[[]byte]
+}
+
+func (b *byteSlicePool) Get() []byte {
+	slice := b.internalPool.Get()
+	if slice == nil {
+		return make([]byte, 0, bytesliceCap)
+	}
+	return slice
+}
+
+func (b *byteSlicePool) Put(buf []byte) {
+	b.internalPool.Put(buf[:0])
+}
+
+var pool = &byteSlicePool{
+	internalPool: gsync.NewPool[[]byte](),
+}
+
 type redHub struct {
-	*gnet.EventServer
-	onOpened     func(c *Conn) (out []byte, action Action)
-	onClosed     func(c *Conn, err error) (action Action)
+	gain.DefaultEventHandler
+	onAccept     func(c Conn)
+	onClose      func(c Conn, err error)
 	handler      func(cmd resp.Command, out []byte) ([]byte, Action)
-	redHubBufMap map[gnet.Conn]*connBuffer
+	redHubBufMap map[gain.Conn]*connBuffer
+	logger       zerolog.Logger
 	connSync     sync.RWMutex
 }
 
@@ -107,40 +118,55 @@ type connBuffer struct {
 	command []resp.Command
 }
 
-func (rs *redHub) OnOpened(c gnet.Conn) (out []byte, action gnet.Action) {
+func (rs *redHub) OnAccept(c gain.Conn) {
 	rs.connSync.Lock()
 	defer rs.connSync.Unlock()
 	rs.redHubBufMap[c] = new(connBuffer)
-	rs.onOpened(&Conn{Conn: c})
+	rs.onAccept(c)
 	return
 }
 
-func (rs *redHub) OnClosed(c gnet.Conn, err error) (action gnet.Action) {
+func (rs *redHub) OnClose(c gain.Conn, err error) {
 	rs.connSync.Lock()
 	defer rs.connSync.Unlock()
 	delete(rs.redHubBufMap, c)
-	rs.onClosed(&Conn{Conn: c}, err)
+	rs.onClose(c, err)
 	return
 }
 
-func (rs *redHub) React(frame []byte, c gnet.Conn) (out []byte, action gnet.Action) {
+func (rs *redHub) OnRead(c gain.Conn, n int) {
 	rs.connSync.RLock()
 	defer rs.connSync.RUnlock()
+	out := pool.Get()
+	defer pool.Put(out)
 	cb, ok := rs.redHubBufMap[c]
 	if !ok {
 		out = resp.AppendError(out, "ERR Client is closed")
+		_, err := c.Write(out)
+		if err != nil {
+			rs.logger.Error().Err(err).Msg("write error")
+		}
+		return
+	}
+	frame, err := c.Next(-1)
+	if err != nil {
+		rs.logger.Error().Err(err).Msg("read error")
 		return
 	}
 	cb.buf.Write(frame)
 	cmds, lastbyte, err := resp.ReadCommands(cb.buf.Bytes())
 	if err != nil {
 		out = resp.AppendError(out, "ERR "+err.Error())
+		_, err = c.Write(out)
+		if err != nil {
+			rs.logger.Error().Err(err).Msg("write error")
+		}
 		return
 	}
 	cb.command = append(cb.command, cmds...)
 	cb.buf.Reset()
+	var status Action
 	if len(lastbyte) == 0 {
-		var status Action
 		for len(cb.command) > 0 {
 			cmd := cb.command[0]
 			if len(cb.command) == 1 {
@@ -149,32 +175,39 @@ func (rs *redHub) React(frame []byte, c gnet.Conn) (out []byte, action gnet.Acti
 				cb.command = cb.command[1:]
 			}
 			out, status = rs.handler(cmd, out)
-			switch status {
-			case Close:
-				action = gnet.Close
-			}
 		}
 	} else {
 		cb.buf.Write(lastbyte)
+	}
+	_, err = c.Write(out)
+	if err != nil {
+		rs.logger.Error().Err(err).Msg("write error")
+	}
+	if status == Close {
+		err = c.Close()
+		if err != nil {
+			rs.logger.Error().Err(err).Msg("close error")
+		}
 	}
 	return
 }
 
 func ListendAndServe(addr string, options Options, rh *redHub) error {
-	serveOptions := gnet.Options{
-		Multicore:        options.Multicore,
-		LockOSThread:     options.LockOSThread,
-		ReadBufferCap:    options.ReadBufferCap,
-		LB:               options.LB,
-		NumEventLoop:     options.NumEventLoop,
-		ReusePort:        options.ReusePort,
-		Ticker:           options.Ticker,
-		TCPKeepAlive:     options.TCPKeepAlive,
-		TCPNoDelay:       options.TCPNoDelay,
-		SocketRecvBuffer: options.SocketRecvBuffer,
-		SocketSendBuffer: options.SocketSendBuffer,
-		Codec:            options.Codec,
+	serveOptions := []gain.ConfigOption{
+		gain.WithArchitecture(options.Architecture),
+		gain.WithAsyncHandler(options.AsyncHandler),
+		gain.WithGoroutinePool(options.GoroutinePool),
+		gain.WithCPUAffinity(options.CPUAffinity),
+		gain.WithProcessPriority(options.ProcessPriority),
+		gain.WithWorkers(options.Workers),
+		gain.WithCBPF(options.CBPFilter),
+		gain.WithLoadBalancing(options.LoadBalancing),
+		gain.WithSocketRecvBufferSize(options.SocketRecvBufferSize),
+		gain.WithSocketSendBufferSize(options.SocketSendBufferSize),
+		gain.WithTCPKeepAlive(options.TCPKeepAlive),
+		gain.WithLoggerLevel(options.LoggerLevel),
+		gain.WithPrettyLogger(options.PrettyLogger),
 	}
 
-	return gnet.Serve(rh, addr, gnet.WithOptions(serveOptions))
+	return gain.ListenAndServe(addr, rh, serveOptions...)
 }
