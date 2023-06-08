@@ -11,9 +11,9 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 
-	"github.com/IceFireDB/redhub"
-	"github.com/IceFireDB/redhub/pkg/resp"
 	"github.com/pawelgaczynski/gain"
+	"github.com/pawelgaczynski/redhub"
+	"github.com/pawelgaczynski/redhub/pkg/resp"
 	"github.com/rs/zerolog"
 )
 
